@@ -633,7 +633,7 @@ async fn test_pin_plan_unions_logical_admission_without_widening_other_objects()
     let executor = PinCacheRefillExecutor::new(store, Arc::new(Semaphore::new(1)));
     planner.replace_pinned_tables(tables.into());
     let raw_delta = intra_level_delta(&[], &inserted, 0);
-    let (refill_plan, membership_changes) = planner.plan_version_update(
+    let (refill_plan, membership_changes) = planner.advance_planning_version(
         &[SstDeltaInfo {
             insert_sst_infos: inserted,
             ..Default::default()

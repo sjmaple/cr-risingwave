@@ -117,7 +117,9 @@ impl PinCacheRefillPlanner {
         }
     }
 
-    /// Advances the planning version and returns `(refill_plan, membership_changes)`.
+    /// Advances `planning_version` and its reference counts, returning
+    /// `(refill_plan, membership_changes)`. This mutates planner state only; it does not
+    /// apply reader-visible versions, register backend membership, or submit refill work.
     /// Only observed SST insertions admit downloads, using the current pin policy.
     /// An already-referenced object can need refill without adding physical membership.
     ///
@@ -126,7 +128,7 @@ impl PinCacheRefillPlanner {
     /// for rebuilds. Raw `version_deltas` detects structural changes absent from SST deltas.
     /// `None` denotes a full version snapshot; `Some` carries every raw delta in order,
     /// including changes omitted by SST extraction. An empty delta batch is not a snapshot.
-    pub(crate) fn plan_version_update(
+    pub(crate) fn advance_planning_version(
         &mut self,
         sst_deltas: &[SstDeltaInfo],
         new_version: PinnedVersion,

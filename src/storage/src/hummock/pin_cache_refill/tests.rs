@@ -148,7 +148,7 @@ fn apply_and_check_version_deltas(
         version.apply_version_delta(delta);
     }
     let after = reference_counts(&version, &planner.pinned_table_ids);
-    let (refill_plan, membership_changes) = planner.plan_version_update(
+    let (refill_plan, membership_changes) = planner.advance_planning_version(
         &sst_deltas,
         PinnedVersion::new(version, mpsc::unbounded_channel().0),
         Some(&deltas),
@@ -235,7 +235,7 @@ fn test_membership_tracks_physical_references() {
     let mut planner = PinCacheRefillPlanner::new(empty.clone());
     planner.replace_pinned_tables(tables.into());
     assert_reference_counts(&planner);
-    let (refill_plan, membership_changes) = planner.plan_version_update(
+    let (refill_plan, membership_changes) = planner.advance_planning_version(
         &[SstDeltaInfo {
             insert_sst_infos: branches[1..].to_vec(),
             ..Default::default()
@@ -250,7 +250,7 @@ fn test_membership_tracks_physical_references() {
     );
     assert_eq!(membership_changes.inserted, [1001.into()].into());
     // A new logical reference can require refill without adding physical membership.
-    let (refill_plan, membership_changes) = planner.plan_version_update(
+    let (refill_plan, membership_changes) = planner.advance_planning_version(
         &[SstDeltaInfo {
             insert_sst_infos: branches[..1].to_vec(),
             ..Default::default()
@@ -264,7 +264,7 @@ fn test_membership_tracks_physical_references() {
         [1001.into()].into()
     );
     assert!(membership_changes.inserted.is_empty() && membership_changes.removed.is_empty());
-    let (_, membership_changes) = planner.plan_version_update(
+    let (_, membership_changes) = planner.advance_planning_version(
         &[SstDeltaInfo {
             delete_sst_infos: vec![branches[0].clone()],
             ..Default::default()
@@ -274,7 +274,7 @@ fn test_membership_tracks_physical_references() {
     );
     assert_reference_counts(&planner);
     assert!(membership_changes.inserted.is_empty() && membership_changes.removed.is_empty());
-    let (_, membership_changes) = planner.plan_version_update(
+    let (_, membership_changes) = planner.advance_planning_version(
         &[SstDeltaInfo {
             delete_sst_infos: vec![branches[1].clone()],
             ..Default::default()
@@ -318,13 +318,13 @@ fn test_membership_tracks_physical_references() {
     }
 
     // A full snapshot restores membership without scheduling a backfill.
-    let (refill_plan, membership_changes) = planner.plan_version_update(&[], both.clone(), None);
+    let (refill_plan, membership_changes) =
+        planner.advance_planning_version(&[], both.clone(), None);
     assert_reference_counts(&planner);
     assert!(refill_plan.objects.is_empty());
     assert_eq!(membership_changes.inserted, [1001.into()].into());
     assert!(membership_changes.removed.is_empty());
-    let (refill_plan, membership_changes) =
-        planner.plan_version_update(&[], both.clone(), Some(&[]));
+    let (refill_plan, membership_changes) = planner.advance_planning_version(&[], both, Some(&[]));
     assert_reference_counts(&planner);
     assert!(
         refill_plan.objects.is_empty()
@@ -503,7 +503,7 @@ fn test_pin_reference_counts_match_versions_across_batch_boundaries() {
     assert!(version.levels[&group].levels[0].table_infos.is_empty());
     assert_eq!(
         version.levels[&group].levels[1].table_infos,
-        vec![output_a.clone()],
+        vec![output_a],
         "the SDK must actually move the SST from L1 to L2"
     );
     let b = version.levels[&group].l0.sub_levels[0].table_infos[0].clone();
