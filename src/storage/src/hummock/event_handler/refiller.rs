@@ -1420,6 +1420,23 @@ mod tests {
                 )
             });
             assert_eq!(actual, expected, "{}", case.name);
+            // Ownership comes from the current runtime maps, independently of Foyer policy.
+            let ownership = refiller.refill_ownership();
+            assert_eq!(ownership.streaming.is_some(), case.role.for_streaming());
+            assert_eq!(ownership.serving.is_some(), case.role.for_serving());
+            assert_eq!(
+                ownership.streaming.and_then(|map| map.get(&table_id)),
+                (case.role.for_streaming() && case.has_streaming_vnodes)
+                    .then_some(&streaming_vnodes),
+                "{}: streaming ownership",
+                case.name
+            );
+            assert_eq!(
+                ownership.serving.and_then(|map| map.get(&table_id)),
+                (case.role.for_serving() && case.has_serving_vnodes).then_some(&serving_vnodes),
+                "{}: serving ownership",
+                case.name
+            );
         }
     }
 
@@ -1463,7 +1480,15 @@ mod tests {
             table_id,
             CacheRefillPolicy::Disabled,
         )]));
-        refiller.replace_serving_table_vnode_mapping(HashMap::from([(table_id, new_vnodes)]));
+        refiller
+            .replace_serving_table_vnode_mapping(HashMap::from([(table_id, new_vnodes.clone())]));
+        assert_eq!(
+            refiller
+                .refill_ownership()
+                .serving
+                .and_then(|map| map.get(&table_id)),
+            Some(&new_vnodes)
+        );
 
         let captured_context = captured_context.lock();
         let context = captured_context
