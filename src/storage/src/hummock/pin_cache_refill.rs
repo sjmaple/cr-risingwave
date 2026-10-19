@@ -38,7 +38,8 @@ mod tests;
 /// This is independent of membership changes: a full snapshot can add membership without
 /// refill intent, and an already-referenced object can acquire new refill intent.
 /// The gate must still narrow candidates against its selected target before submission.
-/// Pending plans may only lose admitted tables; the executor resolves vnode ownership.
+/// Pending plans may only lose admitted tables; metadata admission resolves vnode ownership
+/// before the caller constructs download jobs.
 #[derive(Clone, Default)]
 pub(crate) struct PinCacheRefillPlan {
     pub objects: HashMap<HummockSstableObjectId, PinCacheRefillObject>,
@@ -57,13 +58,13 @@ impl PinCacheRefillPlan {
     fn new(deltas: &[SstDeltaInfo], pinned_tables: &HashSet<TableId>) -> Self {
         let mut objects: HashMap<_, PinCacheRefillObject> = HashMap::new();
         for sst in deltas.iter().flat_map(|delta| &delta.insert_sst_infos) {
-            let admitted_tables: HashSet<_> = sst
+            let mut admitted_tables = sst
                 .table_ids
                 .iter()
                 .copied()
                 .filter(|table| pinned_tables.contains(table))
-                .collect();
-            if admitted_tables.is_empty() {
+                .peekable();
+            if admitted_tables.peek().is_none() {
                 continue;
             }
             objects
