@@ -208,8 +208,13 @@ async fn test_pin_refill_capacity_and_published_route_outcomes() {
         if fits {
             let token = cache.prepare_refill(object).unwrap();
             assert!(matches!(
-                refill_pin_cache_object(&store, &plan.objects[&object].info, &ownership, token)
-                    .await,
+                refill_pin_cache_object(
+                    &store,
+                    &plan.objects[&object].source_sst,
+                    &ownership,
+                    token
+                )
+                .await,
                 Ok(Published)
             ));
         }
@@ -223,14 +228,19 @@ async fn test_pin_refill_capacity_and_published_route_outcomes() {
         if fits {
             let token = cache.prepare_refill(object).unwrap();
             assert!(matches!(
-                refill_pin_cache_object(&store, &plan.objects[&object].info, &ownership, token)
-                    .await,
+                refill_pin_cache_object(
+                    &store,
+                    &plan.objects[&object].source_sst,
+                    &ownership,
+                    token
+                )
+                .await,
                 Ok(AlreadyPublished)
             ));
             assert!(matches!(
                 refill_pin_cache_object(
                     &store,
-                    &plan.objects[&object].info,
+                    &plan.objects[&object].source_sst,
                     &HashMap::new(),
                     token
                 )
@@ -275,7 +285,13 @@ async fn test_failed_admission_is_sticky_for_identical_tickets_and_reset_clears_
     let revoked = cache.prepare_refill(object).unwrap();
     cache.revoke_refill(object);
     assert!(matches!(
-        refill_pin_cache_object(&store, &plan.objects[&object].info, &ownership, revoked).await,
+        refill_pin_cache_object(
+            &store,
+            &plan.objects[&object].source_sst,
+            &ownership,
+            revoked
+        )
+        .await,
         Ok(Obsolete)
     ));
     let first = executor.submit(plan.clone(), ownership_view);
@@ -453,7 +469,7 @@ async fn test_pin_executor_uses_bounded_parallelism_and_targeted_removal() {
         objects.insert(
             info.object_id,
             PinCacheRefillObject {
-                info,
+                source_sst: info,
                 admitted_tables: [table].into(),
             },
         );
@@ -615,10 +631,9 @@ async fn test_pin_plan_unions_logical_admission_without_widening_other_objects()
     let (store, cache) = with_pin_cache(store, u64::MAX).await;
     let mut planner = PinCacheRefillPlanner::new(empty.clone());
     let executor = PinCacheRefillExecutor::new(store, Arc::new(Semaphore::new(1)));
-    let changes = planner.replace_pinned_tables(tables.into(), &[empty]);
-    assert!(changes.inserted.is_empty() && changes.removed.is_empty());
+    planner.replace_pinned_tables(tables.into());
     let raw_delta = intra_level_delta(&[], &inserted, 0);
-    let (plan, changes) = planner.plan_version_update(
+    let (refill_plan, membership_changes) = planner.plan_version_update(
         &[SstDeltaInfo {
             insert_sst_infos: inserted,
             ..Default::default()
@@ -627,17 +642,17 @@ async fn test_pin_plan_unions_logical_admission_without_widening_other_objects()
         Some(&[raw_delta]),
     );
     assert!(
-        changes
+        membership_changes
             .inserted
             .iter()
             .all(|object| !cache.is_registered(*object)),
         "planning must not register future objects"
     );
-    cache.register_objects(changes.inserted);
+    cache.register_objects(membership_changes.inserted);
     let ownership = [(tables[1], Bitmap::ones(VirtualNode::COUNT_FOR_TEST))].into();
     assert!(
         wait(executor.submit(
-            plan,
+            refill_plan,
             RefillOwnership {
                 streaming: Some(&ownership),
                 serving: None,

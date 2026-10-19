@@ -33,17 +33,21 @@ use crate::hummock::local_version::pinned_version::PinnedVersion;
 #[cfg(test)]
 mod tests;
 
-/// Captures table admission while waiting for submission. Vnode ownership is resolved at submit.
+/// Refill intent captured from observed SST insertions under the current pin policy.
+/// This is independent of membership changes: a full snapshot can add membership without
+/// refill intent, and an already-referenced object can acquire new refill intent.
+/// Pending plans may only lose admitted tables; vnode ownership is resolved at submission.
 #[derive(Clone, Default)]
 pub(crate) struct PinCacheRefillPlan {
     pub objects: HashMap<HummockSstableObjectId, PinCacheRefillObject>,
 }
 
-/// One physical descriptor and the tables that admitted this object, independent of ownership.
-/// The descriptor's logical table IDs do not define admission; other references may add tables.
+/// One physical object's refill intent, independent of current vnode ownership.
+/// `source_sst` supplies physical metadata from one logical SST reference. Its `table_ids`
+/// do not define admission: other references to the same object may add admitted tables.
 #[derive(Clone)]
 pub(crate) struct PinCacheRefillObject {
-    pub info: SstableInfo,
+    pub source_sst: SstableInfo,
     pub admitted_tables: HashSet<TableId>,
 }
 
@@ -63,7 +67,7 @@ impl PinCacheRefillPlan {
             objects
                 .entry(sst.object_id)
                 .or_insert_with(|| PinCacheRefillObject {
-                    info: sst.clone(),
+                    source_sst: sst.clone(),
                     admitted_tables: HashSet::new(),
                 })
                 .admitted_tables
@@ -82,10 +86,12 @@ impl PinCacheRefillPlan {
     }
 }
 
-/// Physical membership changes for the version gate to apply at the appropriate boundary.
+/// Added/removed physical objects in the set referenced by pinned logical SSTs.
+/// This describes membership, not downloaded files or refill work. The caller chooses
+/// when to register additions and when resident versions no longer need removals.
 #[derive(Default)]
 #[must_use]
-pub(crate) struct PinCacheObjectChanges {
+pub(crate) struct PinCacheMembershipChanges {
     pub inserted: HashSet<HummockSstableObjectId>,
     pub removed: HashSet<HummockSstableObjectId>,
 }
@@ -99,7 +105,7 @@ pub(crate) struct PinCacheObjectChanges {
 pub(crate) struct PinCacheRefillPlanner {
     pinned_table_ids: HashSet<TableId>,
     object_ref_counts: HashMap<HummockSstableObjectId, u32>,
-    pub(crate) planning_version: PinnedVersion,
+    planning_version: PinnedVersion,
 }
 
 impl PinCacheRefillPlanner {
@@ -111,7 +117,7 @@ impl PinCacheRefillPlanner {
         }
     }
 
-    /// Advances the planning version and returns `(plan, membership_changes)`.
+    /// Advances the planning version and returns `(refill_plan, membership_changes)`.
     /// Only observed SST insertions admit downloads, using the current pin policy.
     /// An already-referenced object can need refill without adding physical membership.
     ///
@@ -125,34 +131,35 @@ impl PinCacheRefillPlanner {
         sst_deltas: &[SstDeltaInfo],
         new_version: PinnedVersion,
         version_deltas: Option<&[HummockVersionDelta]>,
-    ) -> (PinCacheRefillPlan, PinCacheObjectChanges) {
-        let changes = match version_deltas {
+    ) -> (PinCacheRefillPlan, PinCacheMembershipChanges) {
+        let membership_changes = match version_deltas {
             Some(raw_deltas) if !self.requires_membership_rebuild(raw_deltas) => {
                 self.apply_sst_deltas(sst_deltas)
             }
             _ => self.rebuild_membership(&new_version),
         };
         self.planning_version = new_version;
-        let mut plan = PinCacheRefillPlan::new(sst_deltas, &self.pinned_table_ids);
-        plan.objects
+        let mut refill_plan = PinCacheRefillPlan::new(sst_deltas, &self.pinned_table_ids);
+        refill_plan
+            .objects
             .retain(|object, _| self.object_ref_counts.contains_key(object));
-        (plan, changes)
+        (refill_plan, membership_changes)
     }
 
     /// Full update: count references in the new version and compare object membership.
-    fn rebuild_membership(&mut self, version: &HummockVersion) -> PinCacheObjectChanges {
+    fn rebuild_membership(&mut self, version: &HummockVersion) -> PinCacheMembershipChanges {
         let before = self.object_ref_counts.keys().copied().collect();
         self.object_ref_counts = Self::count_pinned_objects(version, &self.pinned_table_ids);
         let after = self.object_ref_counts.keys().copied().collect();
-        PinCacheObjectChanges::between(before, after)
+        PinCacheMembershipChanges::between_objects(before, after)
     }
 
     /// Incremental update: adjust logical reference counts and return the batch's net changes.
     /// SST deltas must describe the transition from the planning version to the new version.
-    fn apply_sst_deltas(&mut self, deltas: &[SstDeltaInfo]) -> PinCacheObjectChanges {
+    fn apply_sst_deltas(&mut self, deltas: &[SstDeltaInfo]) -> PinCacheMembershipChanges {
         let pinned_table_ids = &self.pinned_table_ids;
         if pinned_table_ids.is_empty() {
-            return PinCacheObjectChanges::default();
+            return PinCacheMembershipChanges::default();
         }
 
         let mut initial_counts = HashMap::new();
@@ -196,7 +203,7 @@ impl PinCacheRefillPlanner {
                 inserted.insert(object_id);
             }
         }
-        PinCacheObjectChanges { inserted, removed }
+        PinCacheMembershipChanges { inserted, removed }
     }
 
     /// Detects membership changes that SST insertion/deletion alone cannot describe.
@@ -234,42 +241,17 @@ impl PinCacheRefillPlanner {
         false
     }
 
-    /// Updates pin policy and returns membership changes over the supplied resident snapshots.
-    /// Reference counts are rebuilt for `planning_version`, which may be ahead of residency.
-    pub(crate) fn replace_pinned_tables(
-        &mut self,
-        pinned_table_ids: HashSet<TableId>,
-        resident_versions: &[PinnedVersion],
-    ) -> PinCacheObjectChanges {
+    /// Updates only the planning policy and its reference counts at `planning_version`.
+    /// Resident membership differences are computed separately by `between_policies`.
+    /// The caller must also reproject submitted executor work on policy changes, even
+    /// when a shared object remains in membership through another pinned table.
+    pub(crate) fn replace_pinned_tables(&mut self, pinned_table_ids: HashSet<TableId>) {
         if self.pinned_table_ids == pinned_table_ids {
-            return PinCacheObjectChanges::default();
+            return;
         }
-        let before = resident_versions
-            .iter()
-            .flat_map(|version| Self::pinned_objects(version, &self.pinned_table_ids))
-            .collect();
-        let after = resident_versions
-            .iter()
-            .flat_map(|version| Self::pinned_objects(version, &pinned_table_ids))
-            .collect();
-        let changes = PinCacheObjectChanges::between(before, after);
         self.pinned_table_ids = pinned_table_ids;
         self.object_ref_counts =
             Self::count_pinned_objects(&self.planning_version, &self.pinned_table_ids);
-        changes
-    }
-
-    /// Recomputes a pending version transition after a pin-policy change.
-    /// This comparison does not advance the planning version or its reference counts.
-    pub(crate) fn changes_between_versions(
-        &self,
-        before: &HummockVersion,
-        after: &HummockVersion,
-    ) -> PinCacheObjectChanges {
-        PinCacheObjectChanges::between(
-            Self::pinned_objects(before, &self.pinned_table_ids),
-            Self::pinned_objects(after, &self.pinned_table_ids),
-        )
     }
 
     /// Enumerates pinned logical SST references from a version without reading object storage.
@@ -325,8 +307,44 @@ impl PinCacheRefillPlanner {
     }
 }
 
-impl PinCacheObjectChanges {
-    fn between(
+impl PinCacheMembershipChanges {
+    /// Compares versions under one fixed pin policy, without advancing planner state.
+    pub(crate) fn between_versions(
+        before: &HummockVersion,
+        after: &HummockVersion,
+        pinned_tables: &HashSet<TableId>,
+    ) -> Self {
+        Self::between_objects(
+            PinCacheRefillPlanner::pinned_objects(before, pinned_tables),
+            PinCacheRefillPlanner::pinned_objects(after, pinned_tables),
+        )
+    }
+
+    /// Compares pin policies over the same resident snapshots, independently of planning.
+    /// Union objects across all snapshots before taking the difference: an object can
+    /// remain resident through a different logical reference in another snapshot.
+    pub(crate) fn between_policies(
+        resident_versions: &[PinnedVersion],
+        old_pinned_tables: &HashSet<TableId>,
+        new_pinned_tables: &HashSet<TableId>,
+    ) -> Self {
+        Self::between_objects(
+            resident_versions
+                .iter()
+                .flat_map(|version| {
+                    PinCacheRefillPlanner::pinned_objects(version, old_pinned_tables)
+                })
+                .collect(),
+            resident_versions
+                .iter()
+                .flat_map(|version| {
+                    PinCacheRefillPlanner::pinned_objects(version, new_pinned_tables)
+                })
+                .collect(),
+        )
+    }
+
+    fn between_objects(
         before: HashSet<HummockSstableObjectId>,
         after: HashSet<HummockSstableObjectId>,
     ) -> Self {

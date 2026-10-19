@@ -382,7 +382,7 @@ impl PinCacheRefillExecutor {
                 plan.admitted_tables
                     .retain(|table| ownership.contains_key(table));
                 let ownership = Arc::new(ownership);
-                Some((object, plan.info, plan.admitted_tables, ownership))
+                Some((object, plan.source_sst, plan.admitted_tables, ownership))
             })
             .collect::<Vec<_>>();
         let mut state = self.state.lock();
