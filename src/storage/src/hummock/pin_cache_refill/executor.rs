@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, LazyLock};
 
 use anyhow::Context;
-use futures::future::{Either, Shared, ready};
+use futures::StreamExt;
+use futures::future::{Either, ready};
 use futures::stream::FuturesUnordered;
-use futures::{FutureExt, StreamExt};
 use parking_lot::Mutex;
 use prometheus::{IntCounterVec, register_int_counter_vec_with_registry};
 use risingwave_common::bitmap::Bitmap;
@@ -28,27 +28,21 @@ use risingwave_common::util::panic::FutureCatchUnwindExt;
 use risingwave_hummock_sdk::HummockSstableObjectId;
 use risingwave_hummock_sdk::sstable_info::SstableInfo;
 use risingwave_pb::id::TableId;
-use tokio::sync::{Semaphore, oneshot, watch};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 
-use self::PinCacheRefillAttemptOutcome::{
-    AlreadyPublished, CapacityRejected, NotOwned, Obsolete, Published,
-};
+use self::PinCacheRefillAttemptOutcome::{CapacityRejected, Obsolete, Published};
 use super::PinCacheRefillObject;
-use crate::hummock::pin_cache::{PinCacheDownloadError, PinCacheReadHandle, PinCacheRefillToken};
+use crate::hummock::pin_cache::{PinCacheDownloadError, PinCacheRefillToken};
 use crate::hummock::refill_locality::{
     RefillOwnership, block_vnode_range, vnode_range_overlaps_bitmap,
 };
 use crate::hummock::{Sstable, SstableStoreRef};
 use crate::monitor::StoreLocalStatistic;
 
-/// Ownership rejection can retire only the publication that was checked. A stale backend
-/// token says nothing about ownership of the currently published route.
 enum PinCacheRefillAttemptOutcome {
     Published,
-    AlreadyPublished,
     Obsolete,
     CapacityRejected,
-    NotOwned(Option<PinCacheReadHandle>),
 }
 
 async fn refill_pin_cache_object(
@@ -65,24 +59,18 @@ async fn refill_pin_cache_object(
     if cache.prepare_refill(token.object_id()) != Some(token) {
         return Ok(PinCacheRefillAttemptOutcome::Obsolete);
     }
-    let route = cache.get(token.object_id());
     let mut stats = StoreLocalStatistic::default();
     let sst = store.sstable(info, &mut stats).await;
     stats.discard();
     let sst = sst.context("pin refill ownership metadata")?;
     if !owns_object(&sst, ownership) {
-        return Ok(PinCacheRefillAttemptOutcome::NotOwned(route));
+        return Ok(PinCacheRefillAttemptOutcome::Obsolete);
     }
     drop(sst);
     // Ownership validation may await remote metadata. Do not start a whole-SST transfer for
     // work revoked during that wait; only the final publication check belongs to the backend.
     if cache.prepare_refill(token.object_id()) != Some(token) {
         return Ok(PinCacheRefillAttemptOutcome::Obsolete);
-    }
-    // Check the current route after ownership validation. The captured route above is only
-    // for withdrawing that specific publication if the ownership check rejects it.
-    if cache.get(token.object_id()).is_some() {
-        return Ok(PinCacheRefillAttemptOutcome::AlreadyPublished);
     }
     let download = match cache
         .download(
@@ -138,52 +126,28 @@ fn attempt_result_label<E, P>(
 ) -> &'static str {
     match result {
         Ok(Ok(Published)) => "published",
-        Ok(Ok(AlreadyPublished)) => "already_published",
         Ok(Ok(CapacityRejected)) => "capacity_rejected",
-        Ok(Ok(Obsolete | NotOwned(_))) => "obsolete",
+        Ok(Ok(Obsolete)) => "obsolete",
         Ok(Err(_)) => "error",
         Err(_) => "panic",
     }
 }
 
-type Completion = Shared<oneshot::Receiver<bool>>;
-
 struct Work {
     info: SstableInfo,
     cache_token: PinCacheRefillToken,
     ownership: Arc<HashMap<TableId, Bitmap>>,
-    completion: Completion,
-    completion_sender: oneshot::Sender<bool>,
-}
-
-#[derive(Default)]
-struct State {
-    objects: HashMap<HummockSstableObjectId, Work>,
-    pending: BTreeSet<HummockSstableObjectId>,
-    stopped: bool,
-}
-
-impl State {
-    fn remove(&mut self, object: HummockSstableObjectId) -> Option<Work> {
-        self.pending.remove(&object);
-        self.objects.remove(&object)
-    }
-
-    fn insert(&mut self, object: HummockSstableObjectId, work: Work) {
-        self.remove(object);
-        self.pending.insert(object);
-        self.objects.insert(object, work);
-    }
+    completion: Option<oneshot::Sender<bool>>,
 }
 
 /// Attempts each submitted object once under a shared concurrency limit.
-/// Version deadlines only drop waiters; the worker owns unfinished copies.
-/// Errors and capacity rejection finish the work without background retries.
+/// The gate merges candidates before submission and owns aggregation and deadlines.
+/// Dropping a waiter leaves its copy running; errors finish without background retries.
 pub(crate) struct PinCacheRefillExecutor {
-    // Lock order: executor state -> PinCache shard. PinCache never calls back into this lock.
-    // Keep admission checks and route revocation atomic; never hold state across await.
-    state: Arc<Mutex<State>>,
-    wake: watch::Sender<()>,
+    // Lock order: executor work -> PinCache shard. Never hold work across await.
+    // Cancelled entries remain until their physical attempt exits, preventing overlapping copies.
+    work: Arc<Mutex<HashMap<HummockSstableObjectId, Work>>>,
+    jobs: mpsc::UnboundedSender<HummockSstableObjectId>,
     store: SstableStoreRef,
 }
 
@@ -191,7 +155,6 @@ impl PinCacheRefillExecutor {
     pub(crate) fn new(store: SstableStoreRef, concurrency: Arc<Semaphore>) -> Self {
         for result in [
             "published",
-            "already_published",
             "capacity_rejected",
             "obsolete",
             "error",
@@ -199,32 +162,28 @@ impl PinCacheRefillExecutor {
         ] {
             let _ = REFILL_OUTCOMES.with_label_values(&[result]);
         }
-        let state = Arc::new(Mutex::new(State::default()));
-        let (wake, receiver) = watch::channel(());
-        let limit = concurrency.available_permits().max(1);
+        let work = Arc::new(Mutex::new(HashMap::new()));
+        let (jobs, receiver) = mpsc::unbounded_channel();
         // Capture cleanup before spawning, so even an unpolled driver cancels its waiters.
-        let cleanup = scopeguard::guard(state.clone(), |state| {
-            let mut state = state.lock();
-            state.stopped = true;
-            state.objects.clear();
-            state.pending.clear();
+        let cleanup_work = work.clone();
+        let mut receiver = scopeguard::guard(receiver, move |mut receiver| {
+            receiver.close();
+            cleanup_work.lock().clear();
         });
         let worker_store = store.clone();
-        let worker_state = state.clone();
+        let worker_work = work.clone();
         tokio::spawn(async move {
-            let _cleanup = cleanup;
-            Self::run(worker_store, worker_state, receiver, concurrency, limit).await;
+            Self::run(worker_store, worker_work, &mut receiver, concurrency).await;
         });
-        Self { state, wake, store }
+        Self { work, jobs, store }
     }
 
-    /// Submits one object after the gate has finalized its admitted tables and registered
-    /// backend membership. Unregistered or currently unowned objects need no work.
-    /// Equivalent live submissions share the same attempt result.
-    /// Submission is synchronous; the returned future only waits for the first result.
+    /// Submits one gate-deduplicated object after backend membership is registered.
+    /// Submission is synchronous; the owned future only waits for its result.
     /// True includes published/cached and obsolete/skipped work, not a cache-hit guarantee.
-    /// False means the attempt failed or was cancelled. Failures are not retried automatically.
-    /// Dropping the future does not cancel work; the caller owns aggregation and deadlines.
+    /// False means failure or cancellation, including a duplicate whose previous physical
+    /// attempt has not exited. Duplicates never replace or restart work.
+    /// Dropping the future does not cancel the copy; failures are not retried automatically.
     pub(crate) fn submit(
         &self,
         candidate: PinCacheRefillObject,
@@ -238,7 +197,6 @@ impl PinCacheRefillExecutor {
             admitted_tables,
         } = candidate;
         let object = info.object_id;
-        // Materialize current ownership before locking executor state.
         let ownership: HashMap<_, _> = admitted_tables
             .iter()
             .filter_map(|table| {
@@ -247,72 +205,57 @@ impl PinCacheRefillExecutor {
                     .map(|bitmap| (*table, bitmap.into_owned()))
             })
             .collect();
-        let ownership = Arc::new(ownership);
-        let mut state = self.state.lock();
-        if state.stopped {
+        let mut work = self.work.lock();
+        if self.jobs.is_closed() || work.contains_key(&object) {
             return Either::Left(ready(false));
         }
         if ownership.is_empty() {
             return Either::Left(ready(true));
         }
-        let Some(current_token) = cache.prepare_refill(object) else {
+        let Some(cache_token) = cache.prepare_refill(object) else {
             return Either::Left(ready(true));
         };
-        let completion = if let Some(work) = state.objects.get(&object)
-            && work.cache_token == current_token
-            && work.info == info
-            && work.ownership == ownership
-        {
-            work.completion.clone()
-        } else {
-            // A new ownership/metadata generation must not publish an older in-flight token.
-            cache.revoke_refill(object);
-            let Some(cache_token) = cache.prepare_refill(object) else {
-                state.remove(object);
-                return Either::Left(ready(true));
-            };
-            let (sender, receiver) = oneshot::channel();
-            let completion = receiver.shared();
-            state.insert(
-                object,
-                Work {
-                    info,
-                    cache_token,
-                    ownership,
-                    completion: completion.clone(),
-                    completion_sender: sender,
-                },
-            );
-            drop(state);
-            self.wake.send_replace(());
-            completion
-        };
-        Either::Right(async move { matches!(completion.await, Ok(true)) })
+        // Only uncached objects need an attempt. Gate admission does not revalidate or
+        // withdraw existing files; this executor serializes the only runtime publisher.
+        if cache.get(object).is_some() {
+            return Either::Left(ready(true));
+        }
+        let (sender, receiver) = oneshot::channel();
+        work.insert(
+            object,
+            Work {
+                info,
+                cache_token,
+                ownership: Arc::new(ownership),
+                completion: Some(sender),
+            },
+        );
+        if self.jobs.send(object).is_err() {
+            work.remove(&object);
+        }
+        Either::Right(async move { matches!(receiver.await, Ok(true)) })
     }
 
-    /// Withdraws backend membership before dropping work and completing its waiters.
-    /// Running attempts retain their physical slots until they observe the revoked token.
+    /// Withdraws backend membership before completing waiters. Physical attempts retain
+    /// their entries until they exit; an old token can never publish after unregistration.
     pub(crate) fn unregister_objects(
         &self,
         objects: impl IntoIterator<Item = HummockSstableObjectId>,
     ) {
         let objects: Vec<_> = objects.into_iter().collect();
-        if objects.is_empty() {
-            return;
-        }
         if let Some(cache) = self.store.pin_cache() {
             cache.unregister_objects(objects.iter().copied());
         }
-        let mut state = self.state.lock();
+        let mut work = self.work.lock();
         for object in objects {
-            state.remove(object);
+            if let Some(work) = work.get_mut(&object) {
+                work.completion.take();
+            }
         }
-        drop(state);
-        self.wake.send_replace(());
     }
 
     /// Cancels work whose captured policy/ownership is no longer current.
-    /// Unchanged work continues. Updates never start new attempts or sweep published files.
+    /// Updates never start new attempts or sweep published files.
     pub(crate) fn cancel_changed_work(
         &self,
         ownership: RefillOwnership<'_>,
@@ -321,131 +264,91 @@ impl PinCacheRefillExecutor {
         let Some(cache) = self.store.pin_cache() else {
             return;
         };
-        let mut state = self.state.lock();
-        let State {
-            objects, pending, ..
-        } = &mut *state;
-        objects.retain(|object, work| {
-            // Stale work cannot revoke another admission's token.
-            if cache.prepare_refill(*object) != Some(work.cache_token) {
-                return false;
+        let mut work = self.work.lock();
+        for (object, work) in work.iter_mut() {
+            if work.completion.is_none() {
+                continue;
             }
-            let unchanged = work.ownership.iter().all(|(table, bitmap)| {
+            // Stale work cannot revoke another registration's token.
+            if cache.prepare_refill(*object) != Some(work.cache_token) {
+                work.completion.take();
+                continue;
+            }
+            if !work.ownership.iter().all(|(table, bitmap)| {
                 pinned_tables.contains(table)
                     && ownership.owned_vnodes(table).as_deref() == Some(bitmap)
-            });
-            if !unchanged {
+            }) {
                 cache.revoke_refill(*object);
+                work.completion.take();
             }
-            unchanged
-        });
-        pending.retain(|object| objects.contains_key(object));
-        drop(state);
-        self.wake.send_replace(());
+        }
     }
 
     async fn run(
         store: SstableStoreRef,
-        state: Arc<Mutex<State>>,
-        mut receiver: watch::Receiver<()>,
+        work: Arc<Mutex<HashMap<HummockSstableObjectId, Work>>>,
+        receiver: &mut mpsc::UnboundedReceiver<HummockSstableObjectId>,
         concurrency: Arc<Semaphore>,
-        limit: usize,
     ) {
         let mut tasks = FuturesUnordered::new();
-        // This worker owns per-object download serialization, including across admission changes.
-        // A replacement Work may already be queued while its revoked attempt is still doing I/O.
-        let mut running = HashSet::new();
         loop {
-            let jobs = {
-                let mut state = state.lock();
-                // Replacements wait for their old physical attempt, while unrelated objects
-                // may use the remaining slots. Keep blocked replacements in pending.
-                let jobs: Vec<_> = state
-                    .pending
-                    .iter()
-                    .filter(|object| !running.contains(*object))
-                    .take(limit - running.len())
-                    .map(|object| {
-                        let work = &state.objects[object];
+            tokio::select! {
+                job = receiver.recv() => {
+                    let Some(object) = job else {
+                        break;
+                    };
+                    let (info, ownership, token) = {
+                        let work = work.lock();
+                        let work = &work[&object];
                         (
-                            *object,
                             work.info.clone(),
                             work.ownership.clone(),
                             work.cache_token,
                         )
-                    })
-                    .collect();
-                for (object, ..) in &jobs {
-                    state.pending.remove(object);
+                    };
+                    let store = store.clone();
+                    let concurrency = concurrency.clone();
+                    tasks.push(async move {
+                        let result = AssertUnwindSafe(async {
+                            let _permit = concurrency
+                                .acquire_owned()
+                                .await
+                                .expect("refill concurrency stays open");
+                            refill_pin_cache_object(&store, &info, &ownership, token).await
+                        })
+                        .rw_catch_unwind()
+                        .await;
+                        (object, result)
+                    });
                 }
-                jobs
-            };
-            for (object, info, ownership, cache_token) in jobs {
-                running.insert(object);
-                let store = store.clone();
-                let concurrency = concurrency.clone();
-                tasks.push(async move {
-                    // A panicking I/O task is a failed admission, not a permanently lost waiter.
-                    let result = AssertUnwindSafe(async {
-                        let _permit = concurrency
-                            .acquire_owned()
-                            .await
-                            .expect("refill concurrency stays open");
-                        refill_pin_cache_object(&store, &info, &ownership, cache_token).await
-                    })
-                    .rw_catch_unwind()
-                    .await;
-                    (object, cache_token, result)
-                });
-            }
-            tokio::select! {
-                change = receiver.changed() => if change.is_err() { break; },
-                Some((object, cache_token, result)) = tasks.next(), if !tasks.is_empty() => {
-                    running.remove(&object);
+                Some((object, result)) = tasks.next(), if !tasks.is_empty() => {
                     REFILL_OUTCOMES
                         .with_label_values(&[attempt_result_label(&result)])
                         .inc();
-                    let mut state = state.lock();
-                    if state.objects.get(&object).is_some_and(|work| work.cache_token == cache_token) {
-                        let work = state.remove(object).unwrap();
-                        let ready = match result {
-                            Ok(Ok(Published | AlreadyPublished | Obsolete)) => true,
-                            Ok(Ok(NotOwned(route))) => {
-                                // Both the admission and the publication must still match.
-                                if let Some(route) = route {
-                                    route.invalidate();
-                                }
-                                true
-                            },
-                            Ok(Ok(CapacityRejected)) => {
-                                // Cache pressure must not keep a refill admission alive. Report
-                                // fallback to the version gate and let version application retire
-                                // old files; a later explicit submission may attempt this object again.
-                                false
-                            },
-                            Ok(Err(error)) => {
-                                tracing::warn!(
-                                    object_id = object.as_raw_id(),
-                                    admission = ?cache_token,
-                                    object_size = work.info.file_size,
-                                    error = %format_args!("{error:#}"),
-                                    "pin refill failed; using remote fallback"
-                                );
-                                false
-                            },
-                            Err(_) => {
-                                tracing::warn!(
-                                    object_id = object.as_raw_id(),
-                                    admission = ?cache_token,
-                                    object_size = work.info.file_size,
-                                    "pin refill panicked; using remote fallback"
-                                );
-                                false
-                            }
-                        };
-                        let _ = work.completion_sender.send(ready);
-                    }
-                    drop(state);
+                    let work = work.lock().remove(&object).unwrap();
+                    let Some(completion) = work.completion else {
+                        continue;
+                    };
+                    let ready = match result {
+                        Ok(Ok(Published | Obsolete)) => true,
+                        Ok(Ok(CapacityRejected)) => false,
+                        Ok(Err(error)) => {
+                            tracing::warn!(
+                                object_id = object.as_raw_id(),
+                                error = %format_args!("{error:#}"),
+                                "pin refill failed; using remote fallback"
+                            );
+                            false
+                        },
+                        Err(_) => {
+                            tracing::warn!(
+                                object_id = object.as_raw_id(),
+                                "pin refill panicked; using remote fallback"
+                            );
+                            false
+                        }
+                    };
+                    let _ = completion.send(ready);
                 }
             }
         }
