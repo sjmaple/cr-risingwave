@@ -15,20 +15,70 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
+use bytes::Bytes;
 use futures::task::{ArcWake, waker_ref};
 use risingwave_common::hash::VirtualNode;
+use risingwave_common::util::epoch::test_epoch;
+use risingwave_hummock_sdk::EpochWithGap;
 use risingwave_hummock_sdk::compaction_group::group_split::split_sst_with_table_ids;
 use risingwave_hummock_sdk::compaction_group::hummock_version_ext::SstDeltaInfo;
+use risingwave_hummock_sdk::key::{FullKey, UserKey, prefix_slice_with_vnode};
 use risingwave_hummock_sdk::sstable_info::SstableInfoInner;
 use tokio::sync::mpsc;
 
 use super::*;
+use crate::hummock::TableHolder;
 use crate::hummock::iterator::test_utils::mock_sstable_store;
 use crate::hummock::local_version::pinned_version::PinnedVersion;
-use crate::hummock::pin_cache_refill::tests::{
-    intra_level_delta, sst_with_vnodes, version_with_ssts, with_pin_cache,
-};
-use crate::hummock::pin_cache_refill::{PinCacheRefillController, PinCacheRefillObject};
+use crate::hummock::pin_cache::test_utils::in_memory_object_store;
+use crate::hummock::pin_cache_refill::tests::{intra_level_delta, version_with_ssts};
+use crate::hummock::pin_cache_refill::{PinCacheRefillObject, PinCacheRefillPlanner};
+use crate::hummock::test_utils::{default_builder_opt_for_test, gen_test_sstable_with_table_ids};
+use crate::hummock::value::HummockValue;
+
+// Fixture setup only: registration and publication remain explicit in each test.
+async fn with_pin_cache(store: SstableStoreRef, capacity: u64) -> (SstableStoreRef, Arc<PinCache>) {
+    let cache = PinCache::new(in_memory_object_store(), capacity, 1, [])
+        .await
+        .unwrap();
+    let store = Arc::new(
+        Arc::into_inner(store)
+            .unwrap()
+            .with_pin_cache(cache.clone()),
+    );
+    (store, cache)
+}
+
+// Sorted rows define the physical table/vnode layout; one entry per block exposes boundaries.
+async fn sst_with_vnodes(
+    store: &SstableStoreRef,
+    object: u64,
+    rows: &[(TableId, usize)],
+) -> (TableHolder, SstableInfo) {
+    let mut options = default_builder_opt_for_test();
+    options.block_capacity = 1;
+    let mut tables: Vec<_> = rows.iter().map(|(table, _)| table.as_raw_id()).collect();
+    tables.dedup();
+    gen_test_sstable_with_table_ids(
+        options,
+        object,
+        rows.iter().map(|&(table, vnode)| {
+            (
+                FullKey {
+                    user_key: UserKey::for_test(
+                        table,
+                        prefix_slice_with_vnode(VirtualNode::from_index(vnode), b"key"),
+                    ),
+                    epoch_with_gap: EpochWithGap::new_from_epoch(test_epoch(1)),
+                },
+                HummockValue::put(Bytes::from_static(b"value")),
+            )
+        }),
+        store.clone(),
+        tables,
+    )
+    .await
+}
 
 // Keep asynchronous admission assertions bounded without hiding their expected outcome.
 async fn wait(ticket: Ticket) -> bool {
@@ -59,10 +109,10 @@ async fn test_policy_reset_cannot_revive_shared_object_admission_but_vnode_chang
         let (_, info) = sst_with_vnodes(&store, 874, &[(tables[0], 0), (tables[1], 0)]).await;
         let object = info.object_id;
         let (store, cache) = with_pin_cache(store, u64::MAX).await;
-        let version = version_with_ssts(std::slice::from_ref(&info));
         let concurrency = Arc::new(Semaphore::new(1));
-        let mut controller =
-            PinCacheRefillController::new(store, version.clone(), concurrency.clone());
+        let executor = PinCacheRefillExecutor::new(store, concurrency.clone());
+        let mut pinned_tables = HashSet::from(tables);
+        cache.register_objects([object]);
         let permit = concurrency.acquire().await.unwrap();
         let ownership = HashMap::from([
             (tables[0], Bitmap::ones(VirtualNode::COUNT_FOR_TEST)),
@@ -75,14 +125,7 @@ async fn test_policy_reset_cannot_revive_shared_object_admission_but_vnode_chang
             streaming: Some(&ownership),
             serving: None,
         };
-        let changes = controller.replace_pinned_tables(
-            tables.into(),
-            std::slice::from_ref(&version),
-            ownership_view,
-        );
-        cache.register_objects(changes.inserted);
-        controller.unregister_objects(changes.removed);
-        let ticket = controller.submit(
+        let ticket = executor.submit(
             PinCacheRefillPlan::new(
                 &[SstDeltaInfo {
                     insert_sst_infos: vec![info],
@@ -92,7 +135,7 @@ async fn test_policy_reset_cannot_revive_shared_object_admission_but_vnode_chang
             ),
             ownership_view,
         );
-        wait_running(&controller.executor, object).await;
+        wait_running(&executor, object).await;
 
         // B keeps the physical object and its work alive, but none of O's B blocks are local.
         let without_a = HashMap::from([(tables[1], ownership[&tables[1]].clone())]);
@@ -102,37 +145,30 @@ async fn test_policy_reset_cannot_revive_shared_object_admission_but_vnode_chang
         };
         if migrate_first {
             // RESET must also take effect when ownership is unchanged by the policy update.
-            controller.update_ownership(without_a_view);
+            executor.reproject(without_a_view, &pinned_tables);
         }
         if reset_policy {
-            let changes = controller.replace_pinned_tables(
-                [tables[1]].into(),
-                std::slice::from_ref(&version),
+            pinned_tables = [tables[1]].into();
+            executor.reproject(
                 if migrate_first {
                     without_a_view
                 } else {
                     ownership_view
                 },
+                &pinned_tables,
             );
-            cache.register_objects(changes.inserted);
-            controller.unregister_objects(changes.removed);
         }
-        controller.update_ownership(without_a_view);
+        executor.reproject(without_a_view, &pinned_tables);
         if reset_policy {
-            let changes = controller.replace_pinned_tables(
-                tables.into(),
-                std::slice::from_ref(&version),
-                without_a_view,
-            );
-            cache.register_objects(changes.inserted);
-            controller.unregister_objects(changes.removed);
+            pinned_tables = tables.into();
+            executor.reproject(without_a_view, &pinned_tables);
         }
-        controller.update_ownership(ownership_view);
+        executor.reproject(ownership_view, &pinned_tables);
         assert!(cache.is_registered(object));
         assert!(!wait(ticket).await);
         drop(permit);
         tokio::time::timeout(Duration::from_secs(2), async {
-            while !controller.executor.state.lock().objects.is_empty() {
+            while !executor.state.lock().objects.is_empty() {
                 tokio::task::yield_now().await;
             }
         })
@@ -259,8 +295,7 @@ async fn test_failed_admission_is_sticky_for_identical_tickets_and_reset_clears_
         !next.wait().await,
         "new identical tickets do not reset failed admission"
     );
-    cache.unregister_objects([object]);
-    executor.remove_objects(&[object]);
+    executor.unregister_objects([object]);
     let state = executor.state.lock();
     assert!(state.objects.is_empty() && state.schedule.is_empty());
 }
@@ -425,9 +460,7 @@ async fn test_pin_executor_uses_bounded_parallelism_and_targeted_removal() {
     }
     cache.register_objects(objects.keys().copied());
     let concurrency = Arc::new(Semaphore::new(2));
-    let controller =
-        PinCacheRefillController::new(store, version_with_ssts(&[]), concurrency.clone());
-    let executor = &controller.executor;
+    let executor = PinCacheRefillExecutor::new(store, concurrency.clone());
     // Occupy the shared data budget with Foyer work while Pin queues its attempts.
     let foyer_permits = concurrency.acquire_many(2).await.unwrap();
     let ownership: HashMap<_, _> = [(table, Bitmap::ones(VirtualNode::COUNT_FOR_TEST))].into();
@@ -522,8 +555,8 @@ async fn test_pin_executor_uses_bounded_parallelism_and_targeted_removal() {
             .is_pending()
     );
     let survivor_token = cache.prepare_refill(survivor);
-    controller.unregister_objects([]);
-    controller.unregister_objects(removed);
+    executor.unregister_objects([]);
+    executor.unregister_objects(removed);
     assert!(removed_wakes.0.load(Ordering::Relaxed) > 0);
     assert_eq!(
         survivor_wakes.0.load(Ordering::Relaxed),
@@ -580,13 +613,12 @@ async fn test_pin_plan_unions_logical_admission_without_widening_other_objects()
     empty.state_table_info = target.state_table_info.clone();
     let empty = PinnedVersion::new(empty, mpsc::unbounded_channel().0);
     let (store, cache) = with_pin_cache(store, u64::MAX).await;
-    let mut controller =
-        PinCacheRefillController::new(store, empty.clone(), Arc::new(Semaphore::new(1)));
-    let changes =
-        controller.replace_pinned_tables(tables.into(), &[empty], RefillOwnership::default());
+    let mut planner = PinCacheRefillPlanner::new(empty.clone());
+    let executor = PinCacheRefillExecutor::new(store, Arc::new(Semaphore::new(1)));
+    let changes = planner.replace_pinned_tables(tables.into(), &[empty]);
     assert!(changes.inserted.is_empty() && changes.removed.is_empty());
     let raw_delta = intra_level_delta(&[], &inserted, 0);
-    let (plan, changes) = controller.apply_version_update(
+    let (plan, changes) = planner.plan_version_update(
         &[SstDeltaInfo {
             insert_sst_infos: inserted,
             ..Default::default()
@@ -604,7 +636,7 @@ async fn test_pin_plan_unions_logical_admission_without_widening_other_objects()
     cache.register_objects(changes.inserted);
     let ownership = [(tables[1], Bitmap::ones(VirtualNode::COUNT_FOR_TEST))].into();
     assert!(
-        wait(controller.submit(
+        wait(executor.submit(
             plan,
             RefillOwnership {
                 streaming: Some(&ownership),

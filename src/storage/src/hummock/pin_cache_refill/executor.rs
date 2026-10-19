@@ -295,7 +295,7 @@ impl State {
 /// A bounded object executor, not a version queue. Version deadlines only drop tickets;
 /// this worker continues owning open uploads and retries live-owned I/O failures.
 /// Capacity rejection completes the attempt without retrying or waiting for GC.
-pub(super) struct PinCacheRefillExecutor {
+pub(crate) struct PinCacheRefillExecutor {
     // Lock order: executor state -> PinCache shard. PinCache never calls back into this lock.
     // Keep admission checks and route revocation atomic; never hold state across await.
     state: Arc<Mutex<State>>,
@@ -322,7 +322,7 @@ impl Ticket {
 }
 
 impl PinCacheRefillExecutor {
-    pub(super) fn new(store: SstableStoreRef, concurrency: Arc<Semaphore>) -> Self {
+    pub(crate) fn new(store: SstableStoreRef, concurrency: Arc<Semaphore>) -> Self {
         for result in [
             "published",
             "already_published",
@@ -352,7 +352,7 @@ impl PinCacheRefillExecutor {
         Self { state, wake, store }
     }
 
-    pub(super) fn submit(
+    pub(crate) fn submit(
         &self,
         plan: PinCacheRefillPlan,
         ownership: RefillOwnership<'_>,
@@ -434,18 +434,31 @@ impl PinCacheRefillExecutor {
         Ticket { completions }
     }
 
-    /// Removes only the work whose backend membership has already been withdrawn.
+    /// Withdraws backend membership before dropping work and completing its tickets.
     /// Running attempts retain their physical slots until they observe the revoked token.
-    pub(super) fn remove_objects(&self, objects: &[HummockSstableObjectId]) {
+    pub(crate) fn unregister_objects(
+        &self,
+        objects: impl IntoIterator<Item = HummockSstableObjectId>,
+    ) {
+        let objects: Vec<_> = objects.into_iter().collect();
+        if objects.is_empty() {
+            return;
+        }
+        if let Some(cache) = self.store.pin_cache() {
+            cache.unregister_objects(objects.iter().copied());
+        }
         let mut state = self.state.lock();
-        for &object in objects {
+        for object in objects {
             state.remove(object);
         }
         drop(state);
         self.wake.send_replace(());
     }
 
-    pub(super) fn reproject(
+    /// Reprojects existing work using current policy and ownership, without warming live SSTs.
+    /// Policy revocation permanently narrows admission; vnode changes preserve admitted tables.
+    /// Ownership changes do not sweep published files.
+    pub(crate) fn reproject(
         &self,
         ownership: RefillOwnership<'_>,
         pinned_tables: &HashSet<TableId>,
