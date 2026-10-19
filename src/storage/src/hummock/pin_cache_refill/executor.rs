@@ -86,8 +86,11 @@ struct Work {
 /// Dropping a waiter leaves its copy running; errors finish without background retries.
 pub(crate) struct PinCacheRefillExecutor {
     // Lock order: executor work -> PinCache shard. Never hold work across await.
-    // Cancelled entries remain until their physical attempt exits, preventing overlapping copies.
+    // Indexes dependencies and waiters for queued and running attempts. Cancellation
+    // closes the waiter but keeps the entry until physical exit to prevent overlapping copies.
     work: Arc<Mutex<HashMap<HummockSstableObjectId, Work>>>,
+    // IDs waiting for dispatch; the driver consumes each once and reads its inputs from work.
+    // Dropping the executor's sole sender stops the driver and its unfinished copies.
     jobs: mpsc::UnboundedSender<HummockSstableObjectId>,
     store: SstableStoreRef,
 }

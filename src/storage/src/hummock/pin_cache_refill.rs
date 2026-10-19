@@ -40,7 +40,7 @@ mod tests;
 /// The gate must still narrow candidates against its selected target before submission.
 /// Pending plans may only lose admitted tables; metadata admission resolves vnode ownership
 /// before the caller constructs download jobs.
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub(crate) struct PinCacheRefillPlan {
     pub objects: HashMap<HummockSstableObjectId, PinCacheRefillObject>,
 }
@@ -48,7 +48,6 @@ pub(crate) struct PinCacheRefillPlan {
 /// One physical object's refill intent, independent of current vnode ownership.
 /// `source_sst` supplies physical metadata from one logical SST reference. Its `table_ids`
 /// do not define admission: other references to the same object may add admitted tables.
-#[derive(Clone)]
 pub(crate) struct PinCacheRefillObject {
     pub source_sst: SstableInfo,
     pub admitted_tables: HashSet<TableId>,
