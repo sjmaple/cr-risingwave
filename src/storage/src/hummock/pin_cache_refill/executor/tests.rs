@@ -102,7 +102,7 @@ async fn test_pin_refill_capacity_and_cached_submission() {
 }
 
 #[tokio::test]
-async fn test_failed_attempt_finishes_and_explicit_resubmission_can_succeed() {
+async fn test_failed_attempt_finishes_and_defensive_resubmission_can_succeed() {
     let table = TableId::from(233);
     let store = mock_sstable_store().await;
     let (_, info) = gen_test_sstable_with_table_vnodes(&store, 870, &[(table, 0)]).await;
@@ -121,7 +121,7 @@ async fn test_failed_attempt_finishes_and_explicit_resubmission_can_succeed() {
     let revoked = cache.prepare_refill(object).unwrap();
     cache.revoke_refill(object);
     assert!(matches!(
-        refill_pin_cache_object(&store, &candidate.source_sst, revoked).await,
+        refill_pin_cache_object(&store, candidate.source_sst.file_size, revoked).await,
         Ok(Obsolete)
     ));
     let token = cache.prepare_refill(object).unwrap();
@@ -138,6 +138,7 @@ async fn test_failed_attempt_finishes_and_explicit_resubmission_can_succeed() {
         cache.get(object).is_none(),
         "restoring the remote file does not submit work"
     );
+    // Explicit resubmission is API defense, not evidence of a repeated production delta.
     assert!(wait(executor.submit(&candidate, token)).await);
     assert!(cache.get(object).is_some());
 }
@@ -162,6 +163,7 @@ async fn test_cancelled_attempt_preserves_new_registration_without_restarting() 
             .prepare_refill(candidate.source_sst.object_id)
             .unwrap(),
     );
+    // Exercise stale-work isolation defensively; ordinary cancellation need not re-register.
     executor.unregister_objects([object]);
     cache.register_objects([object]);
     let token = cache.prepare_refill(object);
