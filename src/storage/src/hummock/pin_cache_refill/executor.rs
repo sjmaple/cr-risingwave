@@ -15,9 +15,9 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, LazyLock};
-use std::time::Duration;
 
-use futures::future::{Shared, try_join_all};
+use anyhow::Context;
+use futures::future::{Either, Shared, ready};
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
 use parking_lot::Mutex;
@@ -28,21 +28,17 @@ use risingwave_common::util::panic::FutureCatchUnwindExt;
 use risingwave_hummock_sdk::HummockSstableObjectId;
 use risingwave_hummock_sdk::sstable_info::SstableInfo;
 use risingwave_pb::id::TableId;
-use thiserror_ext::AsReport;
 use tokio::sync::{Semaphore, oneshot, watch};
-use tokio::time::Instant;
 
 use self::PinCacheRefillAttemptOutcome::{
     AlreadyPublished, CapacityRejected, NotOwned, Obsolete, Published,
 };
-use super::PinCacheRefillPlan;
-use crate::hummock::pin_cache::{
-    PinCache, PinCacheDownloadError, PinCacheReadHandle, PinCacheRefillToken,
-};
+use super::PinCacheRefillObject;
+use crate::hummock::pin_cache::{PinCacheDownloadError, PinCacheReadHandle, PinCacheRefillToken};
 use crate::hummock::refill_locality::{
     RefillOwnership, block_vnode_range, vnode_range_overlaps_bitmap,
 };
-use crate::hummock::{HummockError, HummockResult, Sstable, SstableStoreRef};
+use crate::hummock::{Sstable, SstableStoreRef};
 use crate::monitor::StoreLocalStatistic;
 
 /// Ownership rejection can retire only the publication that was checked. A stale backend
@@ -60,7 +56,7 @@ async fn refill_pin_cache_object(
     info: &SstableInfo,
     ownership: &HashMap<TableId, Bitmap>,
     token: PinCacheRefillToken,
-) -> Result<PinCacheRefillAttemptOutcome, PinCacheRefillError> {
+) -> anyhow::Result<PinCacheRefillAttemptOutcome> {
     let Some(cache) = store.pin_cache() else {
         return Ok(PinCacheRefillAttemptOutcome::Obsolete);
     };
@@ -70,15 +66,14 @@ async fn refill_pin_cache_object(
         return Ok(PinCacheRefillAttemptOutcome::Obsolete);
     }
     let route = cache.get(token.object_id());
-    if !pin_cache_object_is_owned(store, info, ownership)
-        .await
-        .map_err(|error| PinCacheRefillError {
-            phase: "ownership_meta",
-            error,
-        })?
-    {
+    let mut stats = StoreLocalStatistic::default();
+    let sst = store.sstable(info, &mut stats).await;
+    stats.discard();
+    let sst = sst.context("pin refill ownership metadata")?;
+    if !owns_object(&sst, ownership) {
         return Ok(PinCacheRefillAttemptOutcome::NotOwned(route));
     }
+    drop(sst);
     // Ownership validation may await remote metadata. Do not start a whole-SST transfer for
     // work revoked during that wait; only the final publication check belongs to the backend.
     if cache.prepare_refill(token.object_id()) != Some(token) {
@@ -103,10 +98,7 @@ async fn refill_pin_cache_object(
             return Ok(PinCacheRefillAttemptOutcome::CapacityRejected);
         }
         Err(PinCacheDownloadError::Io(error)) => {
-            return Err(PinCacheRefillError {
-                phase: "object_copy",
-                error: error.into(),
-            });
+            return Err(error).context("pin refill object copy");
         }
     };
     Ok(if cache.publish(token, download) {
@@ -114,23 +106,6 @@ async fn refill_pin_cache_object(
     } else {
         PinCacheRefillAttemptOutcome::Obsolete
     })
-}
-
-struct PinCacheRefillError {
-    phase: &'static str,
-    error: HummockError,
-}
-
-async fn pin_cache_object_is_owned(
-    store: &SstableStoreRef,
-    info: &SstableInfo,
-    ownership: &HashMap<TableId, Bitmap>,
-) -> HummockResult<bool> {
-    let mut stats = StoreLocalStatistic::default();
-    let sst = store.sstable(info, &mut stats).await;
-    stats.discard();
-    let sst = sst?;
-    Ok(owns_object(&sst, ownership))
 }
 
 /// The executor has already restricted ownership to this object's admitted tables.
@@ -171,154 +146,45 @@ fn attempt_result_label<E, P>(
     }
 }
 
-#[derive(Clone, Copy)]
-enum Status {
-    // Both initial attempts and retries wait here until their deadline.
-    Queued(Instant),
-    Running,
-}
-
-impl Status {
-    fn deadline(self) -> Option<Instant> {
-        match self {
-            Self::Queued(at) => Some(at),
-            Self::Running => None,
-        }
-    }
-}
-
 type Completion = Shared<oneshot::Receiver<bool>>;
 
 struct Work {
     info: SstableInfo,
     cache_token: PinCacheRefillToken,
-    // Submission fixes this admission's lifetime: retries retain it until pin policy,
-    // ownership, or physical membership revokes it. Logical version changes alone do not.
-    admitted_tables: HashSet<TableId>,
     ownership: Arc<HashMap<TableId, Bitmap>>,
     completion: Completion,
-    completion_sender: Option<oneshot::Sender<bool>>,
-    attempts: u32,
-    status: Status,
-}
-
-impl Work {
-    // Only the first result belongs to admission tickets. Later retries cannot turn
-    // a failed admission into a successful one after its version has already degraded.
-    fn finish(&mut self, ready: bool) {
-        if let Some(sender) = self.completion_sender.take() {
-            let _ = sender.send(ready);
-        }
-    }
-
-    fn reproject(
-        &mut self,
-        cache: &Arc<PinCache>,
-        ownership: RefillOwnership<'_>,
-        pinned_tables: &HashSet<TableId>,
-    ) -> bool {
-        let object = self.cache_token.object_id();
-        // Do not revive revoked work or invalidate a publication from a new admission.
-        if cache.prepare_refill(object) != Some(self.cache_token) {
-            return false;
-        }
-        // Policy revocation is permanent for this admission. Temporary vnode changes
-        // must not shrink this set, and later SET cannot restore a revoked table.
-        self.admitted_tables
-            .retain(|table| pinned_tables.contains(table));
-        let projected: Vec<_> = self
-            .admitted_tables
-            .iter()
-            .filter_map(|table| ownership.owned_vnodes(table).map(|bitmap| (*table, bitmap)))
-            .collect();
-        if projected.is_empty() {
-            cache.revoke_refill(object);
-            if let Some(route) = cache.get(object) {
-                route.invalidate();
-            }
-            return false;
-        }
-        if projected.len() == self.ownership.len()
-            && projected
-                .iter()
-                .all(|(table, bitmap)| self.ownership.get(table) == Some(bitmap.as_ref()))
-        {
-            return true;
-        }
-        let ownership = Arc::new(
-            projected
-                .into_iter()
-                .map(|(table, bitmap)| (table, bitmap.into_owned()))
-                .collect(),
-        );
-        cache.revoke_refill(object);
-        let Some(cache_token) = cache.prepare_refill(object) else {
-            return false;
-        };
-        let (sender, receiver) = oneshot::channel();
-        self.cache_token = cache_token;
-        self.completion = receiver.shared();
-        // Dropping the previous sender fails all tickets for the superseded admission.
-        self.completion_sender = Some(sender);
-        self.ownership = ownership;
-        self.status = Status::Queued(Instant::now());
-        self.attempts = 0;
-        true
-    }
+    completion_sender: oneshot::Sender<bool>,
 }
 
 #[derive(Default)]
 struct State {
     objects: HashMap<HummockSstableObjectId, Work>,
-    schedule: BTreeSet<(Instant, HummockSstableObjectId)>,
+    pending: BTreeSet<HummockSstableObjectId>,
     stopped: bool,
 }
 
 impl State {
     fn remove(&mut self, object: HummockSstableObjectId) -> Option<Work> {
-        let work = self.objects.remove(&object)?;
-        if let Some(at) = work.status.deadline() {
-            self.schedule.remove(&(at, object));
-        }
-        Some(work)
+        self.pending.remove(&object);
+        self.objects.remove(&object)
     }
 
     fn insert(&mut self, object: HummockSstableObjectId, work: Work) {
         self.remove(object);
-        if let Some(at) = work.status.deadline() {
-            self.schedule.insert((at, object));
-        }
+        self.pending.insert(object);
         self.objects.insert(object, work);
     }
 }
 
-/// A bounded object executor, not a version queue. Version deadlines only drop tickets;
-/// this worker continues owning open uploads and retries live-owned I/O failures.
-/// Capacity rejection completes the attempt without retrying or waiting for GC.
+/// Attempts each submitted object once under a shared concurrency limit.
+/// Version deadlines only drop waiters; the worker owns unfinished copies.
+/// Errors and capacity rejection finish the work without background retries.
 pub(crate) struct PinCacheRefillExecutor {
     // Lock order: executor state -> PinCache shard. PinCache never calls back into this lock.
     // Keep admission checks and route revocation atomic; never hold state across await.
     state: Arc<Mutex<State>>,
     wake: watch::Sender<()>,
     store: SstableStoreRef,
-}
-
-pub(crate) struct Ticket {
-    // Shared receivers outlive completed work, but do not keep the executor alive.
-    completions: Vec<Completion>,
-}
-
-impl Ticket {
-    pub(crate) async fn wait(self) -> bool {
-        try_join_all(self.completions.into_iter().map(|completion| async move {
-            match completion.await {
-                Ok(true) => Ok(()),
-                Ok(false) | Err(_) => Err(()),
-            }
-        }))
-        .await
-        .is_ok()
-    }
 }
 
 impl PinCacheRefillExecutor {
@@ -336,12 +202,12 @@ impl PinCacheRefillExecutor {
         let state = Arc::new(Mutex::new(State::default()));
         let (wake, receiver) = watch::channel(());
         let limit = concurrency.available_permits().max(1);
-        // Capture cleanup before spawning, so even an unpolled driver cancels its tickets.
+        // Capture cleanup before spawning, so even an unpolled driver cancels its waiters.
         let cleanup = scopeguard::guard(state.clone(), |state| {
             let mut state = state.lock();
             state.stopped = true;
             state.objects.clear();
-            state.schedule.clear();
+            state.pending.clear();
         });
         let worker_store = store.clone();
         let worker_state = state.clone();
@@ -352,65 +218,58 @@ impl PinCacheRefillExecutor {
         Self { state, wake, store }
     }
 
+    /// Submits one object after the gate has finalized its admitted tables and registered
+    /// backend membership. Unregistered or currently unowned objects need no work.
+    /// Equivalent live submissions share the same attempt result.
+    /// Submission is synchronous; the returned future only waits for the first result.
+    /// True includes published/cached and obsolete/skipped work, not a cache-hit guarantee.
+    /// False means the attempt failed or was cancelled. Failures are not retried automatically.
+    /// Dropping the future does not cancel work; the caller owns aggregation and deadlines.
     pub(crate) fn submit(
         &self,
-        plan: PinCacheRefillPlan,
+        candidate: PinCacheRefillObject,
         ownership: RefillOwnership<'_>,
-    ) -> Ticket {
-        let mut completions = Vec::new();
+    ) -> impl Future<Output = bool> + Send + 'static + use<> {
         let Some(cache) = self.store.pin_cache() else {
-            return Ticket { completions };
+            return Either::Left(ready(true));
         };
-        // Resolve each object's admitted tables against current ownership before locking,
-        // so a large submission does not block completions while allocating maps.
-        let objects = plan
-            .objects
-            .into_iter()
-            .filter_map(|(object, mut plan)| {
-                let ownership: HashMap<_, _> = plan
-                    .admitted_tables
-                    .iter()
-                    .filter_map(|table| {
-                        ownership
-                            .owned_vnodes(table)
-                            .map(|bitmap| (*table, bitmap.into_owned()))
-                    })
-                    .collect();
-                if ownership.is_empty() {
-                    return None;
-                }
-                plan.admitted_tables
-                    .retain(|table| ownership.contains_key(table));
-                let ownership = Arc::new(ownership);
-                Some((object, plan.source_sst, plan.admitted_tables, ownership))
+        let PinCacheRefillObject {
+            source_sst: info,
+            admitted_tables,
+        } = candidate;
+        let object = info.object_id;
+        // Materialize current ownership before locking executor state.
+        let ownership: HashMap<_, _> = admitted_tables
+            .iter()
+            .filter_map(|table| {
+                ownership
+                    .owned_vnodes(table)
+                    .map(|bitmap| (*table, bitmap.into_owned()))
             })
-            .collect::<Vec<_>>();
+            .collect();
+        let ownership = Arc::new(ownership);
         let mut state = self.state.lock();
         if state.stopped {
-            // An already cancelled receiver makes a stopped executor fail immediately.
-            return Ticket {
-                completions: vec![oneshot::channel().1.shared()],
-            };
+            return Either::Left(ready(false));
         }
-        for (object, info, admitted_tables, ownership) in objects {
-            let Some(current_token) = cache.prepare_refill(object) else {
-                continue;
-            };
-            if let Some(work) = state.objects.get(&object)
-                && work.cache_token == current_token
-                && work.info == info
-                && work.ownership == ownership
-            {
-                // Failure is sticky for this admission attempt. A new identical ticket
-                // degrades immediately while debt retries; it must not restart its deadline.
-                completions.push(work.completion.clone());
-                continue;
-            }
+        if ownership.is_empty() {
+            return Either::Left(ready(true));
+        }
+        let Some(current_token) = cache.prepare_refill(object) else {
+            return Either::Left(ready(true));
+        };
+        let completion = if let Some(work) = state.objects.get(&object)
+            && work.cache_token == current_token
+            && work.info == info
+            && work.ownership == ownership
+        {
+            work.completion.clone()
+        } else {
             // A new ownership/metadata generation must not publish an older in-flight token.
             cache.revoke_refill(object);
             let Some(cache_token) = cache.prepare_refill(object) else {
                 state.remove(object);
-                continue;
+                return Either::Left(ready(true));
             };
             let (sender, receiver) = oneshot::channel();
             let completion = receiver.shared();
@@ -419,22 +278,19 @@ impl PinCacheRefillExecutor {
                 Work {
                     info,
                     cache_token,
-                    admitted_tables,
                     ownership,
                     completion: completion.clone(),
-                    completion_sender: Some(sender),
-                    attempts: 0,
-                    status: Status::Queued(Instant::now()),
+                    completion_sender: sender,
                 },
             );
-            completions.push(completion);
-        }
-        drop(state);
-        self.wake.send_replace(());
-        Ticket { completions }
+            drop(state);
+            self.wake.send_replace(());
+            completion
+        };
+        Either::Right(async move { matches!(completion.await, Ok(true)) })
     }
 
-    /// Withdraws backend membership before dropping work and completing its tickets.
+    /// Withdraws backend membership before dropping work and completing its waiters.
     /// Running attempts retain their physical slots until they observe the revoked token.
     pub(crate) fn unregister_objects(
         &self,
@@ -455,10 +311,9 @@ impl PinCacheRefillExecutor {
         self.wake.send_replace(());
     }
 
-    /// Reprojects existing work using current policy and ownership, without warming live SSTs.
-    /// Policy revocation permanently narrows admission; vnode changes preserve admitted tables.
-    /// Ownership changes do not sweep published files.
-    pub(crate) fn reproject(
+    /// Cancels work whose captured policy/ownership is no longer current.
+    /// Unchanged work continues. Updates never start new attempts or sweep published files.
+    pub(crate) fn cancel_changed_work(
         &self,
         ownership: RefillOwnership<'_>,
         pinned_tables: &HashSet<TableId>,
@@ -467,26 +322,24 @@ impl PinCacheRefillExecutor {
             return;
         };
         let mut state = self.state.lock();
-        if state.stopped {
-            return;
-        }
         let State {
-            objects, schedule, ..
+            objects, pending, ..
         } = &mut *state;
         objects.retain(|object, work| {
-            let old_deadline = work.status.deadline();
-            let keep = work.reproject(cache, ownership, pinned_tables);
-            let new_deadline = if keep { work.status.deadline() } else { None };
-            if old_deadline != new_deadline {
-                if let Some(at) = old_deadline {
-                    schedule.remove(&(at, *object));
-                }
-                if let Some(at) = new_deadline {
-                    schedule.insert((at, *object));
-                }
+            // Stale work cannot revoke another admission's token.
+            if cache.prepare_refill(*object) != Some(work.cache_token) {
+                return false;
             }
-            keep
+            let unchanged = work.ownership.iter().all(|(table, bitmap)| {
+                pinned_tables.contains(table)
+                    && ownership.owned_vnodes(table).as_deref() == Some(bitmap)
+            });
+            if !unchanged {
+                cache.revoke_refill(*object);
+            }
+            unchanged
         });
+        pending.retain(|object| objects.contains_key(object));
         drop(state);
         self.wake.send_replace(());
     }
@@ -503,39 +356,36 @@ impl PinCacheRefillExecutor {
         // A replacement Work may already be queued while its revoked attempt is still doing I/O.
         let mut running = HashSet::new();
         loop {
-            let (work, next_retry) = {
+            let jobs = {
                 let mut state = state.lock();
-                let mut jobs = Vec::new();
-                while running.len() + jobs.len() < limit {
-                    let Some(&(at, object)) = state.schedule.first() else {
-                        break;
-                    };
-                    if at > Instant::now() {
-                        break;
-                    }
-                    state.schedule.pop_first();
-                    if running.contains(&object) {
-                        // Completion of the old generation re-enables this queued object.
-                        continue;
-                    }
-                    let mut work = state.remove(object).unwrap();
-                    work.status = Status::Running;
-                    jobs.push((
-                        object,
-                        work.info.clone(),
-                        work.ownership.clone(),
-                        work.cache_token,
-                    ));
-                    state.insert(object, work);
+                // Replacements wait for their old physical attempt, while unrelated objects
+                // may use the remaining slots. Keep blocked replacements in pending.
+                let jobs: Vec<_> = state
+                    .pending
+                    .iter()
+                    .filter(|object| !running.contains(*object))
+                    .take(limit - running.len())
+                    .map(|object| {
+                        let work = &state.objects[object];
+                        (
+                            *object,
+                            work.info.clone(),
+                            work.ownership.clone(),
+                            work.cache_token,
+                        )
+                    })
+                    .collect();
+                for (object, ..) in &jobs {
+                    state.pending.remove(object);
                 }
-                (jobs, state.schedule.first().map(|&(at, _)| at))
+                jobs
             };
-            for (object, info, ownership, cache_token) in work {
+            for (object, info, ownership, cache_token) in jobs {
                 running.insert(object);
                 let store = store.clone();
                 let concurrency = concurrency.clone();
                 tasks.push(async move {
-                    // A panicking I/O task is a failed admission, not a permanently lost ticket.
+                    // A panicking I/O task is a failed admission, not a permanently lost waiter.
                     let result = AssertUnwindSafe(async {
                         let _permit = concurrency
                             .acquire_owned()
@@ -550,7 +400,6 @@ impl PinCacheRefillExecutor {
             }
             tokio::select! {
                 change = receiver.changed() => if change.is_err() { break; },
-                _ = tokio::time::sleep_until(next_retry.unwrap_or_else(Instant::now)), if next_retry.is_some() && running.len() < limit => {},
                 Some((object, cache_token, result)) = tasks.next(), if !tasks.is_empty() => {
                     running.remove(&object);
                     REFILL_OUTCOMES
@@ -558,66 +407,43 @@ impl PinCacheRefillExecutor {
                         .inc();
                     let mut state = state.lock();
                     if state.objects.get(&object).is_some_and(|work| work.cache_token == cache_token) {
-                        let mut work = state.remove(object).unwrap();
-                        let retry = match result {
-                            Ok(Ok(Published | AlreadyPublished | Obsolete)) => {
-                                work.finish(true);
-                                false
-                            },
+                        let work = state.remove(object).unwrap();
+                        let ready = match result {
+                            Ok(Ok(Published | AlreadyPublished | Obsolete)) => true,
                             Ok(Ok(NotOwned(route))) => {
                                 // Both the admission and the publication must still match.
                                 if let Some(route) = route {
                                     route.invalidate();
                                 }
-                                work.finish(true);
-                                false
+                                true
                             },
                             Ok(Ok(CapacityRejected)) => {
                                 // Cache pressure must not keep a refill admission alive. Report
                                 // fallback to the version gate and let version application retire
                                 // old files; a later explicit submission may attempt this object again.
-                                work.finish(false);
                                 false
                             },
-                            Ok(Err(PinCacheRefillError { phase, error })) => {
+                            Ok(Err(error)) => {
                                 tracing::warn!(
                                     object_id = object.as_raw_id(),
                                     admission = ?cache_token,
                                     object_size = work.info.file_size,
-                                    attempt = work.attempts + 1,
-                                    phase,
-                                    error = %error.as_report(),
-                                    "pin refill failed; retaining retry debt"
+                                    error = %format_args!("{error:#}"),
+                                    "pin refill failed; using remote fallback"
                                 );
-                                true
+                                false
                             },
                             Err(_) => {
                                 tracing::warn!(
                                     object_id = object.as_raw_id(),
                                     admission = ?cache_token,
                                     object_size = work.info.file_size,
-                                    attempt = work.attempts + 1,
-                                    "pin refill panicked; retaining retry debt"
+                                    "pin refill panicked; using remote fallback"
                                 );
-                                true
+                                false
                             }
                         };
-                        if retry {
-                            work.attempts = work.attempts.saturating_add(1);
-                            work.status = Status::Queued(
-                                Instant::now()
-                                    + Duration::from_millis(
-                                        100 * (1_u64 << work.attempts.min(8)),
-                                    ),
-                            );
-                            work.finish(false);
-                            state.insert(object, work);
-                        }
-                    }
-                    // An old-generation transfer may have occupied this object's slot while
-                    // its replacement was queued. Re-enable that replacement now.
-                    if let Some(at) = state.objects.get(&object).and_then(|work| work.status.deadline()) {
-                        state.schedule.insert((at, object));
+                        let _ = work.completion_sender.send(ready);
                     }
                     drop(state);
                 }

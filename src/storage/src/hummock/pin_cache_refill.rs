@@ -14,9 +14,10 @@
 
 //! Tracks physical object membership from pin policy and Hummock versions.
 //! Version updates either rebuild membership from a snapshot or update counts from SST deltas.
-//! Reports object additions/removals separately from refill plans.
-//! Planning has no backend or executor side effects. The version gate applies membership
-//! changes and submits plans to the independent executor at the appropriate boundary.
+//! Reports object additions/removals separately from refill candidates.
+//! The version gate narrows and merges candidates against its selected target, registers
+//! additions, and submits individual objects to the executor. It retires removals after
+//! applying versions. Advancing the planner has no backend or executor side effects.
 
 use std::collections::{HashMap, HashSet};
 
@@ -33,10 +34,11 @@ use crate::hummock::local_version::pinned_version::PinnedVersion;
 #[cfg(test)]
 mod tests;
 
-/// Refill intent captured from observed SST insertions under the current pin policy.
+/// Refill candidates captured from observed SST insertions under the current pin policy.
 /// This is independent of membership changes: a full snapshot can add membership without
 /// refill intent, and an already-referenced object can acquire new refill intent.
-/// Pending plans may only lose admitted tables; vnode ownership is resolved at submission.
+/// The gate must still narrow candidates against its selected target before submission.
+/// Pending plans may only lose admitted tables; the executor resolves vnode ownership.
 #[derive(Clone, Default)]
 pub(crate) struct PinCacheRefillPlan {
     pub objects: HashMap<HummockSstableObjectId, PinCacheRefillObject>,
@@ -245,7 +247,7 @@ impl PinCacheRefillPlanner {
 
     /// Updates only the planning policy and its reference counts at `planning_version`.
     /// Resident membership differences are computed separately by `between_policies`.
-    /// The caller must also reproject submitted executor work on policy changes, even
+    /// The caller must also cancel affected executor work on policy changes, even
     /// when a shared object remains in membership through another pinned table.
     pub(crate) fn replace_pinned_tables(&mut self, pinned_table_ids: HashSet<TableId>) {
         if self.pinned_table_ids == pinned_table_ids {
